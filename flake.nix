@@ -9,53 +9,39 @@
     let
       supportedSystems = [ "x86_64-linux" ];
       forEachSupportedSystem = f: nixpkgs.lib.genAttrs supportedSystems (system: f {
-        pkgs = import nixpkgs { inherit system; };
-      });
-      mkModule = pkgs: kernel: pkgs.stdenv.mkDerivation {
-        pname = "linuwu-sense";
-        version = "0.1.0";
-        src = self;
-
-        nativeBuildInputs = [ pkgs.gnumake ] ++ kernel.moduleBuildDependencies;
-
-        KDIR = "${kernel.dev}/lib/modules/${kernel.modDirVersion}/build";
-        KVER = kernel.modDirVersion;
-
-        buildPhase = ''
-          runHook preBuild
-          make all KDIR="$KDIR" KVER="$KVER"
-          runHook postBuild
-        '';
-
-        installPhase = ''
-          runHook preInstall
-          install -D -m 644 src/linuwu_sense.ko $out/lib/modules/${kernel.modDirVersion}/kernel/drivers/platform/x86/linuwu_sense.ko
-          runHook postInstall
-        '';
-
-        meta = with pkgs.lib; {
-          description = "Unofficial Linux Kernel Module for Acer Gaming Laptops";
-          license = licenses.gpl2Plus;
-          platforms = platforms.linux;
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ self.overlays.default ];
         };
-      };
+      });
     in
     {
-      packages = forEachSupportedSystem ({ pkgs }:
-        let
-          mod = mkModule pkgs pkgs.linuxPackages_latest.kernel;
-        in {
-          default = mod;
-          linuwu-sense = mod;
-        }
-      );
+      overlays.default = final: prev: {
+        linuxKernel = prev.linuxKernel // {
+          packagesFor = kernel: (prev.linuxKernel.packagesFor kernel).extend (lpself: lpprev: {
+            linuwu-sense = lpself.callPackage ./package.nix { };
+          });
+        };
+      };
+
+      packages = forEachSupportedSystem ({ pkgs }: {
+        default = pkgs.linuxPackages_latest.linuwu-sense;
+        linuwu-sense = pkgs.linuxPackages_latest.linuwu-sense;
+        linuwu-sense-zen = pkgs.linuxPackages_zen.linuwu-sense;
+        linuwu-sense-lts = pkgs.linuxPackages.linuwu-sense;
+      });
 
       devShells = forEachSupportedSystem ({ pkgs }:
         let
           kernel = pkgs.linuxPackages_latest.kernel;
         in {
-          default = pkgs.mkShell {
-            nativeBuildInputs = [ pkgs.gnumake ] ++ kernel.moduleBuildDependencies;
+          default = (pkgs.mkShell.override { stdenv = kernel.stdenv; }) {
+            nativeBuildInputs = [
+              pkgs.gnumake
+              pkgs.bear
+              pkgs.clang-tools
+            ] ++ kernel.moduleBuildDependencies;
+
             shellHook = ''
               export KVER="${kernel.modDirVersion}"
               export KDIR="${kernel.dev}/lib/modules/${kernel.modDirVersion}/build"
@@ -65,12 +51,9 @@
         }
       );
 
-      nixosModules.default = { config, pkgs, ... }: {
-        boot.extraModulePackages = [
-          (mkModule pkgs config.boot.kernelPackages.kernel)
-        ];
-        boot.blacklistedKernelModules = [ "acer_wmi" ];
-        boot.kernelModules = [ "linuwu_sense" ];
+      nixosModules = {
+        default = import ./nixos-module.nix { inherit self; };
+        linuwu-sense = self.nixosModules.default;
       };
     };
 }
