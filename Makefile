@@ -1,7 +1,7 @@
 obj-m := src/linuwu_sense.o
 
 KVER  ?= $(shell uname -r)
-KDIR  := /lib/modules/$(KVER)/build
+KDIR  ?= /lib/modules/$(KVER)/build
 PWD   := $(shell pwd)
 
 MDIR  := /lib/modules/$(KVER)/kernel/drivers/platform/x86
@@ -97,9 +97,20 @@ install: all
 				grep -qxF "$$entry" $$conf_file || echo "$$entry" | sudo tee -a $$conf_file > /dev/null; \
 			done; \
 		fi; \
+		lb_base="/sys/module/$(MODNAME)/drivers/platform:acer-wmi/acer-wmi/rear_lightbar"; \
+		if [ -d "$$lb_base" ]; then \
+			for z in animation zones static_color brightness zone1 zone2 zone3 zone4 zone5 zone6 zone7; do \
+				entry="f $$lb_base/$$z 0660 root $(MODNAME)"; \
+				grep -qxF "$$entry" $$conf_file || echo "$$entry" | sudo tee -a $$conf_file > /dev/null; \
+			done; \
+		fi; \
+		logo_led="/sys/module/$(MODNAME)/drivers/platform:acer-wmi/acer-wmi/logo_led"; \
+		if [ -e "$$logo_led" ]; then \
+			entry="f $$logo_led 0660 root $(MODNAME)"; \
+			grep -qxF "$$entry" $$conf_file || echo "$$entry" | sudo tee -a $$conf_file > /dev/null; \
+		fi; \
 		sudo systemd-tmpfiles --create $$conf_file; \
 	else \
 		echo "Warning: Could not detect predator_sense or nitro_sense in sysfs."; \
 	fi
 	@echo "Module $(MODNAME) installed and configured to load at boot."
-

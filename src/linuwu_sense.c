@@ -36,6 +36,10 @@
  #include <linux/unaligned.h>
  #include <linux/bitfield.h>
  #include <linux/bitmap.h>
+ #include <linux/string.h>
+ #include <linux/ctype.h>
+ #include <linux/miscdevice.h>
+ #include <linux/uaccess.h>
  
  MODULE_AUTHOR("Carlos Corbacho");
  MODULE_DESCRIPTION("Acer Laptop WMI Extras Driver");
@@ -74,6 +78,8 @@
  #define ACER_WMID_SET_GAMING_PROFILE_METHODID 1
  #define ACER_WMID_SET_GAMING_LED_METHODID 2
  #define ACER_WMID_GET_GAMING_LED_METHODID 4
+ #define ACER_WMID_SET_GAMING_LED_BEHAVIOR_METHODID 10
+ #define ACER_WMID_GET_GAMING_LED_BEHAVIOR_METHODID 11
  #define ACER_WMID_GET_GAMING_SYS_INFO_METHODID 5
  #define ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID 14
  #define ACER_WMID_SET_GAMING_FAN_SPEED_METHODID 16
@@ -438,7 +444,8 @@ enum acer_wmi_predator_v4_oc {
  
      if (quirks->predator_v4)
          interface->capability |= ACER_CAP_PLATFORM_PROFILE |
-                      ACER_CAP_FAN_SPEED_READ | ACER_CAP_PREDATOR_SENSE;
+                      ACER_CAP_FAN_SPEED_READ | ACER_CAP_PREDATOR_SENSE |
+                      ACER_CAP_TURBO_LED;
      
      /* Includes all feature that predatorv4 have*/
      if (quirks->nitro_v4)
@@ -486,6 +493,11 @@ enum acer_wmi_predator_v4_oc {
  static struct quirk_entry quirk_acer_predator_phn16_72 = {
     .predator_v4 = 1,
     .four_zone_kb = 1,
+ };
+
+ static struct quirk_entry quirk_acer_predator_ph16_72 = {
+     .predator_v4 = 1,
+     .four_zone_kb = 0,
  };
  
  static struct quirk_entry quirk_acer_nitro_an16_41 = {
@@ -796,6 +808,15 @@ enum acer_wmi_predator_v4_oc {
         },
         .driver_data = &quirk_acer_predator_phn16_72,
     },
+    {
+        .callback = dmi_matched,
+        .ident = "Acer Predator PH16-72",
+        .matches = {
+            DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
+            DMI_MATCH(DMI_PRODUCT_NAME, "Predator PH16-72"),
+        },
+        .driver_data = &quirk_acer_predator_ph16_72,
+    },
      {
          .callback = dmi_matched,
          .ident = "Acer Predator PH16-71",
@@ -947,6 +968,8 @@ enum acer_wmi_predator_v4_oc {
 
   /* The most performant supported profile */
   static int acer_predator_v4_max_perf;
+
+  static u8 current_mode_led_state;
  
  enum acer_predator_v4_thermal_profile {
     ACER_PREDATOR_V4_THERMAL_PROFILE_QUIET		= 0x00,
@@ -1749,44 +1772,74 @@ enum acer_wmi_predator_v4_oc {
      if (!(interface->capability & cap))
          return AE_BAD_PARAMETER;
  
-     switch (cap) {
-     case ACER_CAP_TURBO_LED:
-         method_id = ACER_WMID_SET_GAMING_LED_METHODID;
-         break;
-     case ACER_CAP_TURBO_FAN:
-         method_id = ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID;
-         break;
-     default:
-         return AE_BAD_PARAMETER;
-     }
- 
-     return WMI_gaming_execute_u64(method_id, value, NULL);
- }
- 
- static acpi_status WMID_gaming_get_u64(u64 *value, u32 cap)
- {
-     acpi_status status;
-     u64 result;
-     u64 input;
-     u32 method_id;
- 
-     if (!(interface->capability & cap))
-         return AE_BAD_PARAMETER;
- 
-     switch (cap) {
-     case ACER_CAP_TURBO_LED:
-         method_id = ACER_WMID_GET_GAMING_LED_METHODID;
-         input = 0x1;
-         break;
-     default:
-         return AE_BAD_PARAMETER;
-     }
-     status = WMI_gaming_execute_u64(method_id, input, &result);
-     if (ACPI_SUCCESS(status))
-         *value = (u64) result;
- 
-     return status;
- }
+    switch (cap) {
+    case ACER_CAP_TURBO_LED: {
+        u8 buf[12] = { 0 };
+        struct acpi_buffer in = { (acpi_size)sizeof(buf), buf };
+        struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
+        acpi_status status;
+
+        /*
+         * SetGamingLED (Method 2) on Predator v4 / PH16-72 expects a 12-byte buffer:
+         * Byte 0: 0x01
+         * Byte 2: 0x01 for LED on (0x10001), 0x00 for LED off (0x1)
+         */
+        buf[0] = (u8)(value & 0xff);
+        buf[1] = (u8)((value >> 8) & 0xff);
+        buf[2] = (u8)((value >> 16) & 0xff);
+
+        status = wmi_evaluate_method(WMID_GUID4, 0, ACER_WMID_SET_GAMING_LED_METHODID, &in, &out);
+        kfree(out.pointer);
+        return status;
+    }
+    case ACER_CAP_TURBO_FAN:
+        method_id = ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID;
+        break;
+    default:
+        return AE_BAD_PARAMETER;
+    }
+
+    return WMI_gaming_execute_u64(method_id, value, NULL);
+}
+
+static acpi_status WMID_gaming_get_u64(u64 *value, u32 cap)
+{
+    acpi_status status;
+
+    if (!(interface->capability & cap))
+        return AE_BAD_PARAMETER;
+
+    switch (cap) {
+    case ACER_CAP_TURBO_LED: {
+        u64 input = 0x1;
+        struct acpi_buffer in = { (acpi_size)sizeof(u64), &input };
+        struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
+        union acpi_object *obj;
+
+        status = wmi_evaluate_method(WMID_GUID4, 0, ACER_WMID_GET_GAMING_LED_METHODID, &in, &out);
+        if (ACPI_FAILURE(status))
+            return status;
+
+        obj = (union acpi_object *)out.pointer;
+        if (obj) {
+            if (obj->type == ACPI_TYPE_BUFFER) {
+                if (obj->buffer.length >= 2)
+                    *value = obj->buffer.pointer[1] ? 1 : 0;
+                else if (obj->buffer.length == 1)
+                    *value = obj->buffer.pointer[0] ? 1 : 0;
+                else
+                    *value = 0;
+            } else if (obj->type == ACPI_TYPE_INTEGER) {
+                *value = obj->integer.value ? 1 : 0;
+            }
+            kfree(obj);
+        }
+        return AE_OK;
+    }
+    default:
+        return AE_BAD_PARAMETER;
+    }
+}
  
  static int WMID_gaming_get_sys_info(u32 command, u64 *out)
  {
@@ -2246,6 +2299,16 @@ enum acer_wmi_predator_v4_oc {
      err = WMID_gaming_set_misc_setting(ACER_WMID_MISC_SETTING_PLATFORM_PROFILE, tp);
      if (err)
          return err;
+
+     if (has_cap(ACER_CAP_TURBO_LED)) {
+         if (tp == ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO) {
+             WMID_gaming_set_u64(0x10001, ACER_CAP_TURBO_LED);
+             current_mode_led_state = 1;
+         } else {
+             WMID_gaming_set_u64(0x1, ACER_CAP_TURBO_LED);
+             current_mode_led_state = 0;
+         }
+     }
  
      if (tp != acer_predator_v4_max_perf)
          last_non_turbo_profile = tp;
@@ -2419,6 +2482,16 @@ enum acer_wmi_predator_v4_oc {
                  return -EIO;
              }
          }
+         if (has_cap(ACER_CAP_TURBO_LED)) {
+             if (tp == ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO) {
+                 WMID_gaming_set_u64(0x10001, ACER_CAP_TURBO_LED);
+                 current_mode_led_state = 1;
+             } else {
+                 WMID_gaming_set_u64(0x1, ACER_CAP_TURBO_LED);
+                 current_mode_led_state = 0;
+             }
+         }
+
          /* Store non-turbo profile for turbo mode toggle*/
          if (tp != acer_predator_v4_max_perf)
              last_non_turbo_profile = tp;
@@ -2713,9 +2786,9 @@ enum acer_wmi_predator_v4_oc {
          break;
      case WMID_GAMING_TURBO_KEY_EVENT:
         pr_info("pressed turbo button - %d\n", return_value.key_num);
-         if (return_value.key_num == 0x4  && !has_cap(ACER_CAP_NITRO_SENSE_V4))
+         if (return_value.key_num == 0x4 && has_cap(ACER_CAP_TURBO_OC))
              acer_toggle_turbo();
-         if ((return_value.key_num == 0x5 || (return_value.key_num == 0x4 && has_cap(ACER_CAP_NITRO_SENSE_V4))) && has_cap(ACER_CAP_PLATFORM_PROFILE))
+         if ((return_value.key_num == 0x5 || (return_value.key_num == 0x4 && !has_cap(ACER_CAP_TURBO_OC))) && has_cap(ACER_CAP_PLATFORM_PROFILE))
              acer_thermal_profile_change();
          break;
      case WMID_AC_EVENT:
@@ -3299,13 +3372,10 @@ enum acer_wmi_predator_v4_oc {
      char *token;
      char* input_ptr = input;
      size_t len = min(count, sizeof(input) - 1);
-     strncpy(input, buf, len);
- 
-     if(input[len-1] == '\n'){
+     memcpy(input, buf, len);
+     input[len] = '\0';
+     if (len > 0 && input[len-1] == '\n')
          input[len-1] = '\0';
-     } else {
-         input[len] = '\0';
-     }
  
  
      token = strsep(&input_ptr, ",");
@@ -3590,6 +3660,44 @@ enum acer_wmi_predator_v4_oc {
      return count;
  }
  
+static ssize_t predator_mode_led_show(struct device *dev,
+                                     struct device_attribute *attr,
+                                     char *buf)
+{
+    u64 state = 0;
+    acpi_status status;
+
+    if (has_cap(ACER_CAP_TURBO_LED)) {
+        status = WMID_gaming_get_u64(&state, ACER_CAP_TURBO_LED);
+        if (ACPI_SUCCESS(status))
+            return sprintf(buf, "%d\n", state ? 1 : 0);
+    }
+    return sprintf(buf, "%d\n", current_mode_led_state ? 1 : 0);
+}
+
+static ssize_t predator_mode_led_store(struct device *dev,
+                                      struct device_attribute *attr,
+                                      const char *buf, size_t count)
+{
+    int val;
+    acpi_status status;
+
+    if (sysfs_streq(buf, "1") || sysfs_streq(buf, "on"))
+        val = 1;
+    else if (sysfs_streq(buf, "0") || sysfs_streq(buf, "off"))
+        val = 0;
+    else if (kstrtoint(buf, 10, &val) || (val != 0 && val != 1))
+        return -EINVAL;
+
+    if (has_cap(ACER_CAP_TURBO_LED)) {
+        status = WMID_gaming_set_u64(val ? 0x10001 : 0x1, ACER_CAP_TURBO_LED);
+        if (ACPI_FAILURE(status))
+            return -EIO;
+    }
+    current_mode_led_state = val;
+    return count;
+}
+
  /*
   * predator sense attributes
   */
@@ -3600,6 +3708,8 @@ enum acer_wmi_predator_v4_oc {
  static struct device_attribute battery_limiter = __ATTR(battery_limiter, 0644, predator_battery_limit_show, predator_battery_limit_store);
  static struct device_attribute fan_speed = __ATTR(fan_speed, 0644, predator_fan_speed_show, predator_fan_speed_store);
  static struct device_attribute lcd_override = __ATTR(lcd_override, 0644, predator_lcd_override_show, predator_lcd_override_store);
+ static struct device_attribute mode_led = __ATTR(mode_led, 0644, predator_mode_led_show, predator_mode_led_store);
+ static struct device_attribute turbo_led = __ATTR(turbo_led, 0644, predator_mode_led_show, predator_mode_led_store);
  static struct attribute *predator_sense_attrs[] = {
      &lcd_override.attr,
      &fan_speed.attr,
@@ -3608,6 +3718,8 @@ enum acer_wmi_predator_v4_oc {
      &usb_charging.attr,
      &backlight_timeout.attr,
      &boot_animation_sound.attr,
+     &mode_led.attr,
+     &turbo_led.attr,
      NULL
  };
  
@@ -3749,14 +3861,10 @@ enum acer_wmi_predator_v4_oc {
      char *token;
      char *input_ptr = input_buf;
      size_t len = min(count, sizeof(input_buf) - 1);
- 
-     strncpy(input_buf, buf, len);
- 
-     if(input_buf[len-1] == '\n'){
+     memcpy(input_buf, buf, len);
+     input_buf[len] = '\0';
+     if (len > 0 && input_buf[len-1] == '\n')
          input_buf[len-1] = '\0';
-     } else {
-         input_buf[len] = '\0';
-     }
  
      token = strsep(&input_ptr, ",");
      if (!token || kstrtoint(token, 10, &mode) || mode < 0 || mode > 7) {
@@ -3923,12 +4031,10 @@ enum acer_wmi_predator_v4_oc {
      struct per_zone_color colors;
      char *input_ptr = str_buf;
      len = min(count, sizeof(str_buf) - 1);
-     strncpy(str_buf, buf, len);
-     if(str_buf[len-1] == '\n'){
+     memcpy(str_buf, buf, len);
+     str_buf[len] = '\0';
+     if (len > 0 && str_buf[len-1] == '\n')
          str_buf[len-1] = '\0';
-     } else {
-         str_buf[len] = '\0';
-     }
  
      acpi_status status;
  
@@ -4074,6 +4180,736 @@ enum acer_wmi_predator_v4_oc {
  static struct attribute_group four_zoned_kb_attr_group = {
      .name = "four_zoned_kb", .attrs = four_zoned_kb_attrs
  };
+
+/*
+ * Acer Rear Lightbar (EC ACPI-WMI GUID4)
+ * Physical 7-zone addressable exhaust lightbar on Predator Helios 16/18.
+ */
+static DEFINE_MUTEX(rear_lightbar_mutex);
+
+struct rear_lightbar_state {
+    bool static_armed;
+    u8 brightness;
+    u8 mode;
+    u8 speed;
+    u8 direction;
+    u32 colors[7];
+};
+
+static struct rear_lightbar_state lb_state = {
+    .brightness = 100,
+    .mode = 1,
+    .speed = 3,
+    .direction = 2,
+};
+
+static int lightbar_unlock(void)
+{
+    static const u8 unlock_16[16] = {
+        0x10, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF,
+        0x55, 0x15, 0x00, 0x00
+    };
+    static const u8 unlock_12[12] = {
+        0x10, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0xFF, 0xFF,
+        0xFF, 0x15, 0x00, 0x00
+    };
+    struct acpi_buffer in16 = { sizeof(unlock_16), (void *)unlock_16 };
+    struct acpi_buffer in12 = { sizeof(unlock_12), (void *)unlock_12 };
+    struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
+    acpi_status status;
+
+    /* Try Method 10 (SetGamingLEDBehavior) with 16 bytes first */
+    status = wmi_evaluate_method(WMID_GUID4, 0, ACER_WMID_SET_GAMING_LED_BEHAVIOR_METHODID, &in16, &out);
+    kfree(out.pointer);
+    out.pointer = NULL;
+    if (ACPI_SUCCESS(status))
+        return 0;
+
+    /* Fallback: Method 2 (SetGamingLED) with 12 bytes */
+    status = wmi_evaluate_method(WMID_GUID4, 0, ACER_WMID_SET_GAMING_LED_METHODID, &in12, &out);
+    kfree(out.pointer);
+    out.pointer = NULL;
+    if (ACPI_SUCCESS(status))
+        return 0;
+
+    /* Fallback: Method 2 with 16 bytes */
+    status = wmi_evaluate_method(WMID_GUID4, 0, ACER_WMID_SET_GAMING_LED_METHODID, &in16, &out);
+    kfree(out.pointer);
+    if (ACPI_SUCCESS(status))
+        return 0;
+
+    return -EIO;
+}
+
+static int lightbar_arm_static(u8 brightness)
+{
+    u8 arm_payload[16] = {
+        0x00, 0x00, brightness, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x03, 0x02, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+    struct acpi_buffer in = { sizeof(arm_payload), arm_payload };
+    struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
+    acpi_status status;
+
+    status = wmi_evaluate_method(WMID_GUID4, 0, ACER_WMID_SET_GAMING_KB_BACKLIGHT_METHODID, &in, &out);
+    kfree(out.pointer);
+    if (ACPI_FAILURE(status))
+        return -EIO;
+    return 0;
+}
+
+static int lightbar_send_zone(u8 zone_idx, u8 r, u8 g, u8 b)
+{
+    u8 zone_mask = (1 << zone_idx);
+    u64 payload = ((u64)zone_mask << 40) |
+                  (0x08ULL        << 32) |
+                  ((u64)b         << 24) |
+                  ((u64)g         << 16) |
+                  ((u64)r         << 8);
+    acpi_status status;
+
+    status = WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_RGB_KB_METHODID, payload, NULL);
+    if (ACPI_FAILURE(status))
+        return -EIO;
+    return 0;
+}
+
+static int lightbar_update_zone(u8 zone_idx, u8 r, u8 g, u8 b)
+{
+    int ret;
+
+    if (zone_idx >= 7)
+        return -EINVAL;
+
+    mutex_lock(&rear_lightbar_mutex);
+
+    /* If not in static mode yet, perform the priming handshake */
+    if (!lb_state.static_armed) {
+        ret = lightbar_unlock();
+        if (ret)
+            pr_warn("rear_lightbar: unlock failed (%d)\n", ret);
+
+        ret = lightbar_arm_static(lb_state.brightness);
+        if (ret) {
+            mutex_unlock(&rear_lightbar_mutex);
+            return ret;
+        }
+        lb_state.static_armed = true;
+    }
+
+    lb_state.colors[zone_idx] = ((u32)r << 16) | ((u32)g << 8) | (u32)b;
+    ret = lightbar_send_zone(zone_idx, r, g, b);
+
+    mutex_unlock(&rear_lightbar_mutex);
+    return ret;
+}
+
+static int lightbar_update_all_zones(const u32 colors[7], u8 brightness)
+{
+    int ret = 0;
+    int i;
+
+    mutex_lock(&rear_lightbar_mutex);
+
+    lb_state.brightness = brightness;
+
+    if (!lb_state.static_armed) {
+        ret = lightbar_unlock();
+        if (ret)
+            pr_warn("rear_lightbar: unlock failed (%d)\n", ret);
+
+        ret = lightbar_arm_static(brightness);
+        if (ret) {
+            mutex_unlock(&rear_lightbar_mutex);
+            return ret;
+        }
+        lb_state.static_armed = true;
+    } else {
+        ret = lightbar_arm_static(brightness);
+        if (ret) {
+            mutex_unlock(&rear_lightbar_mutex);
+            return ret;
+        }
+    }
+
+    for (i = 0; i < 7; i++) {
+        u8 r = (colors[i] >> 16) & 0xff;
+        u8 g = (colors[i] >> 8) & 0xff;
+        u8 b = colors[i] & 0xff;
+
+        lb_state.colors[i] = colors[i];
+        ret = lightbar_send_zone(i, r, g, b);
+        if (ret)
+            break;
+    }
+
+    mutex_unlock(&rear_lightbar_mutex);
+    return ret;
+}
+
+static int lightbar_set_hw_animation(u8 mode, u8 speed, u8 brightness, u8 direction)
+{
+    u8 anim_payload[16] = {
+        mode, speed, brightness, 0x00,
+        direction, 0x00, 0x00, 0x00,
+        0x03, 0x02, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+    struct acpi_buffer in = { sizeof(anim_payload), anim_payload };
+    struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
+    acpi_status status;
+
+    mutex_lock(&rear_lightbar_mutex);
+
+    status = wmi_evaluate_method(WMID_GUID4, 0, ACER_WMID_SET_GAMING_KB_BACKLIGHT_METHODID, &in, &out);
+    kfree(out.pointer);
+
+    if (ACPI_FAILURE(status)) {
+        mutex_unlock(&rear_lightbar_mutex);
+        return -EIO;
+    }
+
+    lb_state.mode = mode;
+    lb_state.speed = speed;
+    lb_state.brightness = brightness;
+    lb_state.direction = direction;
+    lb_state.static_armed = false;
+
+    mutex_unlock(&rear_lightbar_mutex);
+    return 0;
+}
+
+static int parse_rgb_hex(const char *str, u8 *r, u8 *g, u8 *b)
+{
+    char tmp[7];
+    u32 hex;
+    int len = 0;
+
+    while (*str == ' ' || *str == '\t')
+        str++;
+
+    if (str[0] == '#' || (str[0] == '0' && (str[1] == 'x' || str[1] == 'X')))
+        str += (str[0] == '#') ? 1 : 2;
+
+    while (isxdigit(str[len]) && len < 6) {
+        tmp[len] = str[len];
+        len++;
+    }
+    tmp[len] = '\0';
+
+    if (len != 6)
+        return -EINVAL;
+
+    if (kstrtou32(tmp, 16, &hex))
+        return -EINVAL;
+
+    *r = (hex >> 16) & 0xff;
+    *g = (hex >> 8) & 0xff;
+    *b = hex & 0xff;
+    return 0;
+}
+
+static ssize_t rear_lightbar_zones_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%06x,%06x,%06x,%06x,%06x,%06x,%06x,%d\n",
+                   lb_state.colors[0], lb_state.colors[1], lb_state.colors[2],
+                   lb_state.colors[3], lb_state.colors[4], lb_state.colors[5],
+                   lb_state.colors[6], lb_state.brightness);
+}
+
+static ssize_t rear_lightbar_zones_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    char kbuf[96];
+    char *s = kbuf;
+    char *token;
+    int commas = 0;
+    size_t len;
+    int ret;
+
+    len = min(count, sizeof(kbuf) - 1);
+    memcpy(kbuf, buf, len);
+    kbuf[len] = '\0';
+    if (len > 0 && kbuf[len - 1] == '\n')
+        kbuf[len - 1] = '\0';
+
+    for (token = kbuf; *token; token++) {
+        if (*token == ',')
+            commas++;
+    }
+
+    if (commas <= 2) {
+        int zone_idx;
+        u8 r, g, b;
+
+        token = strsep(&s, ",");
+        if (!token || kstrtoint(token, 10, &zone_idx))
+            return -EINVAL;
+
+        if (zone_idx >= 1 && zone_idx <= 7)
+            zone_idx -= 1;
+        else if (zone_idx < 0 || zone_idx >= 7)
+            return -EINVAL;
+
+        token = strsep(&s, ",");
+        if (!token || parse_rgb_hex(token, &r, &g, &b))
+            return -EINVAL;
+
+        if (s && *s) {
+            int br;
+            if (!kstrtoint(s, 10, &br) && br >= 0 && br <= 100)
+                lb_state.brightness = br;
+        }
+
+        ret = lightbar_update_zone(zone_idx, r, g, b);
+        if (ret)
+            return ret;
+    } else {
+        u32 new_colors[7];
+        int br = lb_state.brightness;
+        int i = 0;
+
+        while ((token = strsep(&s, ",")) && i < 7) {
+            u8 r, g, b;
+            if (parse_rgb_hex(token, &r, &g, &b))
+                return -EINVAL;
+            new_colors[i++] = ((u32)r << 16) | ((u32)g << 8) | (u32)b;
+        }
+
+        if (i != 7)
+            return -EINVAL;
+
+        if (s && *s) {
+            if (kstrtoint(s, 10, &br) || br < 0 || br > 100)
+                return -EINVAL;
+        }
+
+        ret = lightbar_update_all_zones(new_colors, br);
+        if (ret)
+            return ret;
+    }
+
+    return count;
+}
+
+static ssize_t rear_lightbar_zone_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    int idx = attr->attr.name[4] - '1';
+    if (idx < 0 || idx >= 7)
+        return -EINVAL;
+    return sprintf(buf, "%06x\n", lb_state.colors[idx]);
+}
+
+static ssize_t rear_lightbar_zone_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    int idx = attr->attr.name[4] - '1';
+    char kbuf[16];
+    size_t len;
+    u8 r, g, b;
+    int ret;
+
+    if (idx < 0 || idx >= 7)
+        return -EINVAL;
+
+    len = min(count, sizeof(kbuf) - 1);
+    memcpy(kbuf, buf, len);
+    kbuf[len] = '\0';
+    if (len > 0 && kbuf[len - 1] == '\n')
+        kbuf[len - 1] = '\0';
+
+    ret = parse_rgb_hex(kbuf, &r, &g, &b);
+    if (ret)
+        return ret;
+
+    ret = lightbar_update_zone(idx, r, g, b);
+    if (ret)
+        return ret;
+
+    return count;
+}
+
+static ssize_t rear_lightbar_static_color_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%06x,%d\n", lb_state.colors[0], lb_state.brightness);
+}
+
+static ssize_t rear_lightbar_static_color_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    char kbuf[32];
+    char *s = kbuf;
+    char *token;
+    size_t len;
+    u8 r, g, b;
+    u32 color;
+    u32 colors[7];
+    int br = lb_state.brightness;
+    int ret, i;
+
+    len = min(count, sizeof(kbuf) - 1);
+    memcpy(kbuf, buf, len);
+    kbuf[len] = '\0';
+    if (len > 0 && kbuf[len - 1] == '\n')
+        kbuf[len - 1] = '\0';
+
+    token = strsep(&s, ",");
+    if (!token || parse_rgb_hex(token, &r, &g, &b))
+        return -EINVAL;
+
+    if (s && *s) {
+        if (kstrtoint(s, 10, &br) || br < 0 || br > 100)
+            return -EINVAL;
+    }
+
+    color = ((u32)r << 16) | ((u32)g << 8) | (u32)b;
+    for (i = 0; i < 7; i++)
+        colors[i] = color;
+
+    ret = lightbar_update_all_zones(colors, br);
+    if (ret)
+        return ret;
+
+    return count;
+}
+
+static ssize_t rear_lightbar_brightness_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%d\n", lb_state.brightness);
+}
+
+static ssize_t rear_lightbar_brightness_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    int val, ret;
+
+    if (kstrtoint(buf, 10, &val) || val < 0 || val > 100)
+        return -EINVAL;
+
+    if (lb_state.static_armed)
+        ret = lightbar_update_all_zones(lb_state.colors, val);
+    else
+        ret = lightbar_set_hw_animation(lb_state.mode, lb_state.speed, val, lb_state.direction);
+
+    if (ret)
+        return ret;
+
+    return count;
+}
+
+static const char *lightbar_mode_to_name(u8 mode)
+{
+    switch (mode) {
+    case 0:  return "off";
+    case 1:  return "breathing";
+    case 2:  return "neon";
+    case 3:  return "wave";
+    case 9:  return "snake";
+    case 10: return "lightning";
+    case 11: return "stack";
+    case 12: return "motion_point";
+    case 13: return "zoom";
+    default: return "unknown";
+    }
+}
+
+static int lightbar_name_to_mode(const char *name)
+{
+    if (!strcasecmp(name, "off")) return 0;
+    if (!strcasecmp(name, "static")) return -EINVAL; /* Static must use static_color/zones */
+    if (!strcasecmp(name, "breathing")) return 1;
+    if (!strcasecmp(name, "neon")) return 2;
+    if (!strcasecmp(name, "wave")) return 3;
+    if (!strcasecmp(name, "snake")) return 9;
+    if (!strcasecmp(name, "lightning")) return 10;
+    if (!strcasecmp(name, "stack")) return 11;
+    if (!strcasecmp(name, "motion_point") || !strcasecmp(name, "motionpoint") || !strcasecmp(name, "motion point")) return 12;
+    if (!strcasecmp(name, "zoom")) return 13;
+    return -EINVAL;
+}
+
+static ssize_t rear_lightbar_animation_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    if (lb_state.static_armed)
+        return sprintf(buf, "mode=static (active) speed=%d brightness=%d\n",
+                       lb_state.speed, lb_state.brightness);
+
+    return sprintf(buf, "mode=%d (%s) speed=%d brightness=%d direction=%d\n",
+                   lb_state.mode, lightbar_mode_to_name(lb_state.mode),
+                   lb_state.speed, lb_state.brightness, lb_state.direction);
+}
+
+static ssize_t rear_lightbar_animation_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    char kbuf[64];
+    char *s = kbuf;
+    char *token;
+    int mode_val = -1;
+    int speed = lb_state.speed;
+    int brightness = lb_state.brightness;
+    int direction = lb_state.direction;
+    size_t len;
+    int ret;
+
+    len = min(count, sizeof(kbuf) - 1);
+    memcpy(kbuf, buf, len);
+    kbuf[len] = '\0';
+    if (len > 0 && kbuf[len - 1] == '\n')
+        kbuf[len - 1] = '\0';
+
+    token = strsep(&s, ", ");
+    if (!token)
+        return -EINVAL;
+
+    mode_val = lightbar_name_to_mode(token);
+    if (mode_val < 0) {
+        if (kstrtoint(token, 10, &mode_val) || mode_val < 0 || mode_val > 15)
+            return -EINVAL;
+    }
+
+    if (s && *s) {
+        token = strsep(&s, ", ");
+        if (token && *token && !kstrtoint(token, 10, &speed)) {
+            if (speed < 1 || speed > 5)
+                return -EINVAL;
+        }
+    }
+
+    if (s && *s) {
+        token = strsep(&s, ", ");
+        if (token && *token && !kstrtoint(token, 10, &brightness)) {
+            if (brightness < 0 || brightness > 100)
+                return -EINVAL;
+        }
+    }
+
+    if (s && *s) {
+        token = strsep(&s, ", ");
+        if (token && *token && !kstrtoint(token, 10, &direction)) {
+            if (direction != 1 && direction != 2)
+                return -EINVAL;
+        }
+    }
+
+    if (mode_val == 0)
+        ret = lightbar_set_hw_animation(0, 0, 0, 2);
+    else
+        ret = lightbar_set_hw_animation(mode_val, speed, brightness, direction);
+
+    if (ret)
+        return ret;
+
+    return count;
+}
+
+static struct device_attribute rear_lightbar_zones = __ATTR(zones, 0644, rear_lightbar_zones_show, rear_lightbar_zones_store);
+static struct device_attribute rear_lightbar_zone1 = __ATTR(zone1, 0644, rear_lightbar_zone_show, rear_lightbar_zone_store);
+static struct device_attribute rear_lightbar_zone2 = __ATTR(zone2, 0644, rear_lightbar_zone_show, rear_lightbar_zone_store);
+static struct device_attribute rear_lightbar_zone3 = __ATTR(zone3, 0644, rear_lightbar_zone_show, rear_lightbar_zone_store);
+static struct device_attribute rear_lightbar_zone4 = __ATTR(zone4, 0644, rear_lightbar_zone_show, rear_lightbar_zone_store);
+static struct device_attribute rear_lightbar_zone5 = __ATTR(zone5, 0644, rear_lightbar_zone_show, rear_lightbar_zone_store);
+static struct device_attribute rear_lightbar_zone6 = __ATTR(zone6, 0644, rear_lightbar_zone_show, rear_lightbar_zone_store);
+static struct device_attribute rear_lightbar_zone7 = __ATTR(zone7, 0644, rear_lightbar_zone_show, rear_lightbar_zone_store);
+static struct device_attribute rear_lightbar_static = __ATTR(static_color, 0644, rear_lightbar_static_color_show, rear_lightbar_static_color_store);
+static struct device_attribute rear_lightbar_bright = __ATTR(brightness, 0644, rear_lightbar_brightness_show, rear_lightbar_brightness_store);
+static struct device_attribute rear_lightbar_anim = __ATTR(animation, 0644, rear_lightbar_animation_show, rear_lightbar_animation_store);
+
+static struct attribute *rear_lightbar_attrs[] = {
+    &rear_lightbar_zones.attr,
+    &rear_lightbar_zone1.attr,
+    &rear_lightbar_zone2.attr,
+    &rear_lightbar_zone3.attr,
+    &rear_lightbar_zone4.attr,
+    &rear_lightbar_zone5.attr,
+    &rear_lightbar_zone6.attr,
+    &rear_lightbar_zone7.attr,
+    &rear_lightbar_static.attr,
+    &rear_lightbar_bright.attr,
+    &rear_lightbar_anim.attr,
+    NULL
+};
+
+static struct attribute_group rear_lightbar_attr_group = {
+    .name = "rear_lightbar",
+    .attrs = rear_lightbar_attrs,
+};
+
+/*
+ * Acer base logo (EC ACPI-WMI GUID4)
+ *
+ * The base logo shares the gaming WMI device with the rear lightbar, but is
+ * controlled by a separate two-call protocol.  Method 12 carries the color
+ * state and method 10 selects the effect.  Keep the two calls together: the
+ * firmware applies the effect to the color state most recently programmed.
+ */
+#define ACER_BASE_LOGO_ZONE             0x01
+#define ACER_BASE_LOGO_MODE_OFF         0x00
+#define ACER_BASE_LOGO_MODE_STATIC      0x01
+#define ACER_BASE_LOGO_MODE_BREATHING   0x03
+#define ACER_BASE_LOGO_MODE_NEON        0x04
+/* AcerGamingFunction method IDs from the firmware Binary MOF:
+ *   10 = SetGamingLEDBehavior (uint64 input)
+ *   12 = SetGamingLEDColor    (uint64 input)
+ */
+#define ACER_BASE_LOGO_SET_COLOR_METHODID    12
+#define ACER_BASE_LOGO_SET_BEHAVIOR_METHODID 10
+
+static DEFINE_MUTEX(base_logo_mutex);
+
+struct base_logo_state {
+    u32 color;
+    u8 brightness;
+    u8 speed;
+    u8 mode;
+};
+
+static struct base_logo_state base_logo_state = {
+    .brightness = 100,
+    .speed = 5,
+    .mode = ACER_BASE_LOGO_MODE_STATIC,
+};
+
+static int base_logo_apply_locked(void)
+{
+    u64 color;
+    u64 behavior;
+    acpi_status status;
+
+    color = ACER_BASE_LOGO_ZONE |
+            ((u64)((base_logo_state.color >> 16) & 0xff) << 8) |
+            ((u64)((base_logo_state.color >> 8) & 0xff) << 16) |
+            ((u64)(base_logo_state.color & 0xff) << 24) |
+            ((u64)base_logo_state.brightness << 32) |
+            ((u64)base_logo_state.speed << 40);
+    behavior = ACER_BASE_LOGO_ZONE | ((u64)base_logo_state.mode << 16);
+
+    status = WMI_gaming_execute_u64(ACER_BASE_LOGO_SET_COLOR_METHODID,
+                                    color, NULL);
+    if (ACPI_FAILURE(status))
+        return -EIO;
+
+    /* SetGamingLEDBehavior also takes a uint64 according to the Binary MOF. */
+    return WMI_gaming_execute_u64(
+        ACER_BASE_LOGO_SET_BEHAVIOR_METHODID, behavior, NULL);
+}
+
+static const char *base_logo_mode_name(u8 mode)
+{
+    switch (mode) {
+    case ACER_BASE_LOGO_MODE_OFF:
+        return "off";
+    case ACER_BASE_LOGO_MODE_STATIC:
+        return "static";
+    case ACER_BASE_LOGO_MODE_BREATHING:
+        return "breathing";
+    case ACER_BASE_LOGO_MODE_NEON:
+        return "neon";
+    default:
+        return "unknown";
+    }
+}
+
+static int base_logo_parse_mode(const char *name, u8 *mode)
+{
+    if (!strcasecmp(name, "off"))
+        *mode = ACER_BASE_LOGO_MODE_OFF;
+    else if (!strcasecmp(name, "static"))
+        *mode = ACER_BASE_LOGO_MODE_STATIC;
+    else if (!strcasecmp(name, "breathing"))
+        *mode = ACER_BASE_LOGO_MODE_BREATHING;
+    else if (!strcasecmp(name, "neon"))
+        *mode = ACER_BASE_LOGO_MODE_NEON;
+    else
+        return -EINVAL;
+
+    return 0;
+}
+
+/* Atomic lightbar-style update: RRGGBB,brightness,speed,effect. */
+static ssize_t base_logo_state_show(struct device *dev,
+                                    struct device_attribute *attr, char *buf)
+{
+    ssize_t len;
+
+    mutex_lock(&base_logo_mutex);
+    len = sysfs_emit(buf, "%06x,%u,%u,%s\n", base_logo_state.color,
+                     base_logo_state.brightness, base_logo_state.speed,
+                     base_logo_mode_name(base_logo_state.mode));
+    mutex_unlock(&base_logo_mutex);
+
+    return len;
+}
+
+static ssize_t base_logo_state_store(struct device *dev,
+                                     struct device_attribute *attr,
+                                     const char *buf, size_t count)
+{
+    char input[64];
+    char *cursor;
+    char *token;
+    struct base_logo_state new_state;
+    struct base_logo_state old_state;
+    u8 red, green, blue;
+    u8 mode;
+    int ret;
+
+    if (count >= sizeof(input))
+        return -EINVAL;
+
+    memcpy(input, buf, count);
+    input[count] = '\0';
+    cursor = strim(input);
+
+    token = strsep(&cursor, ",");
+    if (!token || parse_rgb_hex(token, &red, &green, &blue))
+        return -EINVAL;
+    new_state.color = ((u32)red << 16) | ((u32)green << 8) | blue;
+
+    token = strsep(&cursor, ",");
+    if (!token || kstrtou8(strim(token), 10, &new_state.brightness) ||
+        new_state.brightness > 100)
+        return -EINVAL;
+
+    token = strsep(&cursor, ",");
+    if (!token || kstrtou8(strim(token), 10, &new_state.speed) ||
+        new_state.speed < 1 || new_state.speed > 5)
+        return -EINVAL;
+
+    token = strsep(&cursor, ",");
+    if (!token || cursor)
+        return -EINVAL;
+
+    token = strim(token);
+    ret = base_logo_parse_mode(token, &mode);
+    if (ret)
+        return ret;
+    new_state.mode = mode;
+
+    mutex_lock(&base_logo_mutex);
+    old_state = base_logo_state;
+    base_logo_state = new_state;
+    ret = base_logo_apply_locked();
+    if (ret)
+        base_logo_state = old_state;
+    mutex_unlock(&base_logo_mutex);
+
+    return ret ? ret : count;
+}
+
+static struct device_attribute logo_led_attr =
+    __ATTR(logo_led, 0644, base_logo_state_show, base_logo_state_store);
+
+static struct attribute *base_logo_attrs[] = {
+    &logo_led_attr.attr,
+    NULL,
+};
+
+static const struct attribute_group base_logo_attr_group = {
+    .name = NULL,
+    .attrs = base_logo_attrs,
+};
+
  /*
   * Platform device
   */
@@ -4128,6 +4964,16 @@ enum acer_wmi_predator_v4_oc {
              goto error_four_zone;
          four_zone_kb_state_load();
      }
+
+    if (wmi_has_guid(WMID_GUID4)) {
+        err = sysfs_create_group(&device->dev.kobj, &rear_lightbar_attr_group);
+        if (err)
+            goto error_rear_lightbar;
+
+        err = sysfs_create_group(&device->dev.kobj, &base_logo_attr_group);
+        if (err)
+            goto error_base_logo;
+    }
  
      if (has_cap(ACER_CAP_FAN_SPEED_READ)) {
          err = acer_wmi_hwmon_init();
@@ -4138,6 +4984,12 @@ enum acer_wmi_predator_v4_oc {
      return 0;
  
  error_hwmon:
+     if (wmi_has_guid(WMID_GUID4))
+         sysfs_remove_group(&device->dev.kobj, &base_logo_attr_group);
+ error_base_logo:
+     if (wmi_has_guid(WMID_GUID4))
+         sysfs_remove_group(&device->dev.kobj, &rear_lightbar_attr_group);
+ error_rear_lightbar:
  error_platform_profile:
      acer_rfkill_exit();
  error_rfkill:
@@ -4168,7 +5020,7 @@ enum acer_wmi_predator_v4_oc {
          acer_predator_state_save();
      }
      if (has_cap(ACER_CAP_NITRO_SENSE)) {
-        sysfs_remove_group(&device->dev.kobj, &nitro_sense_v4_attr_group);
+        sysfs_remove_group(&device->dev.kobj, &nitro_sense_attr_group);
         acer_predator_state_save();
      }
      if (has_cap(ACER_CAP_NITRO_SENSE_V4)) {
@@ -4178,6 +5030,10 @@ enum acer_wmi_predator_v4_oc {
      if(quirks->four_zone_kb){
          sysfs_remove_group(&device->dev.kobj, &four_zoned_kb_attr_group);
          four_zone_kb_state_save();
+     }
+     if (wmi_has_guid(WMID_GUID4)) {
+         sysfs_remove_group(&device->dev.kobj, &base_logo_attr_group);
+         sysfs_remove_group(&device->dev.kobj, &rear_lightbar_attr_group);
      }
  
      acer_rfkill_exit();
