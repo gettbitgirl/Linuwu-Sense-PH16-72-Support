@@ -2963,6 +2963,116 @@ static acpi_status WMID_gaming_get_u64(u64 *value, u32 cap)
      return err;
  }
  
+/*
+ * Sunrex USB Gaming Keyboard PredatorSense Key Support (05af:666a)
+ *
+ * Modern Acer Predator/Nitro models route the dedicated PredatorSense
+ * button through the Sunrex USB microcontroller as an active-low ABS_MISC
+ * event (value 0 on press, 1 on release). We translate this into KEY_PROG1
+ * reported through the Acer WMI hotkeys input device.
+ */
+static void acer_sunrex_event(struct input_handle *handle, unsigned int type,
+                              unsigned int code, int value)
+{
+    if (type == EV_ABS && code == ABS_MISC) {
+        if (acer_wmi_input_dev) {
+            if (value == 0) {
+                input_report_key(acer_wmi_input_dev, KEY_PROG1, 1);
+                input_sync(acer_wmi_input_dev);
+            } else if (value == 1) {
+                input_report_key(acer_wmi_input_dev, KEY_PROG1, 0);
+                input_sync(acer_wmi_input_dev);
+            }
+        }
+    }
+}
+
+static int acer_sunrex_connect(struct input_handler *handler, struct input_dev *dev,
+                               const struct input_device_id *id)
+{
+    struct input_handle *handle;
+    int error;
+
+    /*
+     * The Sunrex USB keyboard exposes multiple interfaces (keyboard, consumer,
+     * wireless control, and a dedicated interface with EV_ABS/ABS_MISC).
+     * Only attach to the interface that actually carries ABS_MISC.
+     */
+    if (!test_bit(EV_ABS, dev->evbit) || !test_bit(ABS_MISC, dev->absbit))
+        return -ENODEV;
+
+    handle = kzalloc(sizeof(struct input_handle), GFP_KERNEL);
+    if (!handle)
+        return -ENOMEM;
+
+    handle->dev = dev;
+    handle->handler = handler;
+    handle->name = "acer_sunrex_handle";
+
+    error = input_register_handle(handle);
+    if (error)
+        goto err_free_handle;
+
+    error = input_open_device(handle);
+    if (error)
+        goto err_unregister_handle;
+
+    pr_info("attached to Sunrex keyboard PredatorSense key on %s\n",
+            dev_name(&dev->dev));
+    return 0;
+
+err_unregister_handle:
+    input_unregister_handle(handle);
+err_free_handle:
+    kfree(handle);
+    return error;
+}
+
+static void acer_sunrex_disconnect(struct input_handle *handle)
+{
+    input_close_device(handle);
+    input_unregister_handle(handle);
+    kfree(handle);
+}
+
+static const struct input_device_id acer_sunrex_ids[] = {
+    {
+        .flags = INPUT_DEVICE_ID_MATCH_BUS | INPUT_DEVICE_ID_MATCH_VENDOR |
+                 INPUT_DEVICE_ID_MATCH_PRODUCT,
+        .bustype = BUS_USB,
+        .vendor = 0x05af,
+        .product = 0x666a,
+    },
+    { },
+};
+
+static struct input_handler acer_sunrex_handler = {
+    .event = acer_sunrex_event,
+    .connect = acer_sunrex_connect,
+    .disconnect = acer_sunrex_disconnect,
+    .name = "acer_sunrex_predatorsense",
+    .id_table = acer_sunrex_ids,
+};
+
+static bool acer_sunrex_handler_registered;
+
+static void acer_sunrex_init(void)
+{
+    int ret = input_register_handler(&acer_sunrex_handler);
+    if (ret)
+        pr_warn("failed to register Sunrex input handler: %d\n", ret);
+    else
+        acer_sunrex_handler_registered = true;
+}
+
+static void acer_sunrex_exit(void)
+{
+    if (acer_sunrex_handler_registered) {
+        input_unregister_handler(&acer_sunrex_handler);
+        acer_sunrex_handler_registered = false;
+    }
+}
+
  static int __init acer_wmi_input_setup(void)
  {
      acpi_status status;
@@ -2979,6 +3089,8 @@ static acpi_status WMID_gaming_get_u64(u64 *value, u32 cap)
      err = sparse_keymap_setup(acer_wmi_input_dev, acer_wmi_keymap, NULL);
      if (err)
          goto err_free_dev;
+
+     input_set_capability(acer_wmi_input_dev, EV_KEY, KEY_PROG1);
  
      if (has_cap(ACER_CAP_KBD_DOCK))
          input_set_capability(acer_wmi_input_dev, EV_SW, SW_TABLET_MODE);
@@ -2997,6 +3109,8 @@ static acpi_status WMID_gaming_get_u64(u64 *value, u32 cap)
      if (err)
          goto err_uninstall_notifier;
  
+     acer_sunrex_init();
+ 
      return 0;
  
  err_uninstall_notifier:
@@ -3008,6 +3122,7 @@ static acpi_status WMID_gaming_get_u64(u64 *value, u32 cap)
  
  static void acer_wmi_input_destroy(void)
  {
+     acer_sunrex_exit();
      wmi_remove_notify_handler(ACERWMID_EVENT_GUID);
      input_unregister_device(acer_wmi_input_dev);
  }
