@@ -26,13 +26,19 @@ kernel.stdenv.mkDerivation {
   makeFlags = kernelModuleMakeFlags ++ [
     "KDIR=${kernel.dev}/lib/modules/${kernel.modDirVersion}/build"
     "KVER=${kernel.modDirVersion}"
+    "INSTALL_MOD_PATH=${placeholder "out"}"
+    "INSTALL_MOD_DIR=kernel/drivers/platform/x86"
+    "INSTALL_MOD_STRIP=1"
+    "DEPMOD=true"
   ];
 
-  installPhase = ''
-    runHook preInstall
-    install -D -m 644 src/linuwu_sense.ko $out/lib/modules/${kernel.modDirVersion}/kernel/drivers/platform/x86/linuwu_sense.ko
-    runHook postInstall
-  '';
+  installTargets = [ "modules_install" ];
+
+  installFlags = [
+    "-C"
+    "${kernel.dev}/lib/modules/${kernel.modDirVersion}/build"
+    "M=$(PWD)"
+  ];
 
   meta = {
     description = "Unofficial Linux Kernel Module for Acer Gaming Laptops (Predator and Nitro)";

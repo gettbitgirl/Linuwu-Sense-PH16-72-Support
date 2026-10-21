@@ -8,8 +8,13 @@ MDIR  := /lib/modules/$(KVER)/kernel/drivers/platform/x86
 MODNAME := linuwu_sense
 REAL_USER := $(shell echo $${SUDO_USER:-$$(whoami)})
 
-all:
+all: modules
+
+modules:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+modules_install:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
 
 	# --- auto sign block ---
 	# Check if keys exist before attempting to sign
